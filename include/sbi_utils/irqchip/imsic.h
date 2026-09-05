@@ -12,6 +12,7 @@
 #define __IRQCHIP_IMSIC_H__
 
 #include <sbi/sbi_types.h>
+#include <sbi/sbi_irqchip.h>
 
 #define IMSIC_MMIO_PAGE_SHIFT		12
 #define IMSIC_MMIO_PAGE_SZ		(1UL << IMSIC_MMIO_PAGE_SHIFT)
@@ -24,6 +25,8 @@ struct imsic_regs {
 };
 
 struct imsic_data {
+	struct sbi_irqchip_device irqchip;
+	u32 unique_id;
 	bool targets_mmode;
 	u32 guest_index_bits;
 	u32 hart_index_bits;
@@ -37,13 +40,11 @@ struct imsic_data {
 
 int imsic_map_hartid_to_data(u32 hartid, struct imsic_data *imsic, int file);
 
-struct imsic_data *imsic_get_data(u32 hartid);
+struct imsic_data *imsic_get_data(u32 hartindex);
 
-int imsic_get_target_file(u32 hartid);
+int imsic_get_target_file(u32 hartindex);
 
 void imsic_local_irqchip_init(void);
-
-int imsic_warm_irqchip_init(void);
 
 int imsic_data_check(struct imsic_data *imsic);
 

@@ -77,6 +77,16 @@ struct sbi_dbtr_hart_triggers_state {
 	u32 probed;
 };
 
+/** Platform specific debug trigger operations */
+struct sbi_dbtr_device {
+	char name[32];
+	bool (*trigger_supported)(unsigned long idx, unsigned long tdata1,
+				  unsigned long tdata2, unsigned long tdata3);
+};
+
+const struct sbi_dbtr_device *sbi_dbtr_get_device(void);
+void sbi_dbtr_set_device(const struct sbi_dbtr_device *dev);
+
 #define TDATA1_GET_TYPE(_t1)					\
 	EXTRACT_FIELD(_t1, RV_DBTR_BIT_MASK(TDATA1, TYPE))
 
@@ -90,7 +100,7 @@ struct sbi_dbtr_hart_triggers_state {
 	}while (0);
 
 /** SBI shared mem messages layout */
-struct sbi_dbtr_shmem_entry {
+union sbi_dbtr_shmem_entry {
 	struct sbi_dbtr_data_msg data;
 	struct sbi_dbtr_id_msg id;
 };
@@ -115,8 +125,7 @@ int sbi_dbtr_uninstall_trig(unsigned long trig_idx_base,
 int sbi_dbtr_enable_trig(unsigned long trig_idx_base,
 			 unsigned long trig_idx_mask);
 int sbi_dbtr_update_trig(unsigned long smode,
-			 unsigned long trig_idx_base,
-			 unsigned long trig_idx_mask);
+			 unsigned long trig_count);
 int sbi_dbtr_disable_trig(unsigned long trig_idx_base,
 			  unsigned long trig_idx_mask);
 

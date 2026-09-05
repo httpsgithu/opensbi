@@ -15,9 +15,11 @@
 #include <sbi/sbi_domain.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
+#include <sbi/sbi_heap.h>
 #include <sbi/sbi_hsm.h>
 #include <sbi/sbi_init.h>
 #include <sbi/sbi_ipi.h>
+#include <sbi/sbi_list.h>
 #include <sbi/sbi_platform.h>
 #include <sbi/sbi_pmu.h>
 #include <sbi/sbi_string.h>
@@ -32,8 +34,14 @@ _Static_assert(
 	"type of sbi_ipi_data.ipi_type has changed, please redefine SBI_IPI_EVENT_MAX"
 	);
 
+struct sbi_ipi_device_node {
+	struct sbi_dlist head;
+	const struct sbi_ipi_device *dev;
+};
+
 static unsigned long ipi_data_off;
 static const struct sbi_ipi_device *ipi_dev = NULL;
+static SBI_LIST_HEAD(ipi_dev_node_list);
 static const struct sbi_ipi_event_ops *ipi_ops_array[SBI_IPI_EVENT_MAX];
 
 static int sbi_ipi_send(struct sbi_scratch *scratch, u32 remote_hartindex,
@@ -80,7 +88,7 @@ static int sbi_ipi_send(struct sbi_scratch *scratch, u32 remote_hartindex,
 	 */
 	if (!__atomic_fetch_or(&ipi_data->ipi_type,
 				BIT(event), __ATOMIC_RELAXED))
-		ret = sbi_ipi_raw_send(remote_hartindex);
+		ret = sbi_ipi_raw_send(remote_hartindex, false);
 
 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_IPI_SENT);
 
@@ -111,31 +119,41 @@ int sbi_ipi_send_many(ulong hmask, ulong hbase, u32 event, void *data)
 {
 	int rc = 0;
 	bool retry_needed;
-	ulong i, m;
-	struct sbi_hartmask target_mask = {0};
+	ulong i;
+	struct sbi_hartmask target_mask;
 	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 
+	if (hmask == 0 && hbase != -1UL) {
+		/* Nothing to do, but it's not an error either. */
+		return 0;
+	}
+
 	/* Find the target harts */
+	rc = sbi_hsm_hart_interruptible_mask(dom, &target_mask);
+	if (rc)
+		return rc;
+
 	if (hbase != -1UL) {
-		rc = sbi_hsm_hart_interruptible_mask(dom, hbase, &m);
+		struct sbi_hartmask tmp_mask = { 0 };
+		struct sbi_hartmask domain_mask;
+		int count = sbi_popcount(hmask);
+
+		for (i = hbase; hmask; i++, hmask >>= 1) {
+			if (hmask & 1UL)
+				sbi_hartmask_set_hartid(i, &tmp_mask);
+		}
+
+		/* Validate hartids against domain assignment, not HSM state */
+		rc = sbi_domain_get_assigned_hartmask(dom, &domain_mask);
 		if (rc)
 			return rc;
-		m &= hmask;
 
-		for (i = hbase; m; i++, m >>= 1) {
-			if (m & 1UL)
-				sbi_hartmask_set_hartid(i, &target_mask);
-		}
-	} else {
-		hbase = 0;
-		while (!sbi_hsm_hart_interruptible_mask(dom, hbase, &m)) {
-			for (i = hbase; m; i++, m >>= 1) {
-				if (m & 1UL)
-					sbi_hartmask_set_hartid(i, &target_mask);
-			}
-			hbase += BITS_PER_LONG;
-		}
+		sbi_hartmask_and(&domain_mask, &domain_mask, &tmp_mask);
+		if (sbi_hartmask_weight(&domain_mask) != count)
+			return SBI_EINVAL;
+
+		sbi_hartmask_and(&target_mask, &target_mask, &tmp_mask);
 	}
 
 	/* Send IPIs */
@@ -208,6 +226,15 @@ void sbi_ipi_clear_smode(void)
 	csr_clear(CSR_MIP, MIP_SSIP);
 }
 
+static int sbi_ipi_update_halt(struct sbi_scratch *scratch,
+			       struct sbi_scratch *remote_scratch,
+			       u32 remote_hartindex, void *data)
+{
+	/* Never send a halt IPI to the local hart. */
+	return scratch == remote_scratch ?
+		SBI_IPI_UPDATE_BREAK : SBI_IPI_UPDATE_SUCCESS;
+}
+
 static void sbi_ipi_process_halt(struct sbi_scratch *scratch)
 {
 	sbi_hsm_hart_stop(scratch, true);
@@ -215,6 +242,7 @@ static void sbi_ipi_process_halt(struct sbi_scratch *scratch)
 
 static struct sbi_ipi_event_ops ipi_halt_ops = {
 	.name = "IPI_HALT",
+	.update = sbi_ipi_update_halt,
 	.process = sbi_ipi_process_halt,
 };
 
@@ -233,10 +261,9 @@ void sbi_ipi_process(void)
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 	struct sbi_ipi_data *ipi_data =
 			sbi_scratch_offset_ptr(scratch, ipi_data_off);
-	u32 hartindex = sbi_hartid_to_hartindex(current_hartid());
 
 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_IPI_RECVD);
-	sbi_ipi_raw_clear(hartindex);
+	sbi_ipi_raw_clear(false);
 
 	ipi_type = atomic_raw_xchg_ulong(&ipi_data->ipi_type, 0);
 	ipi_event = 0;
@@ -251,8 +278,10 @@ void sbi_ipi_process(void)
 	}
 }
 
-int sbi_ipi_raw_send(u32 hartindex)
+int sbi_ipi_raw_send(u32 hartindex, bool all_devices)
 {
+	struct sbi_ipi_device_node *entry;
+
 	if (!ipi_dev || !ipi_dev->ipi_send)
 		return SBI_EINVAL;
 
@@ -267,14 +296,31 @@ int sbi_ipi_raw_send(u32 hartindex)
 	 */
 	wmb();
 
-	ipi_dev->ipi_send(hartindex);
+	if (all_devices) {
+		sbi_list_for_each_entry(entry, &ipi_dev_node_list, head) {
+			if (entry->dev->ipi_send)
+				entry->dev->ipi_send(hartindex);
+		}
+	} else {
+		ipi_dev->ipi_send(hartindex);
+	}
+
 	return 0;
 }
 
-void sbi_ipi_raw_clear(u32 hartindex)
+void sbi_ipi_raw_clear(bool all_devices)
 {
-	if (ipi_dev && ipi_dev->ipi_clear)
-		ipi_dev->ipi_clear(hartindex);
+	struct sbi_ipi_device_node *entry;
+
+	if (all_devices) {
+		sbi_list_for_each_entry(entry, &ipi_dev_node_list, head) {
+			if (entry->dev->ipi_clear)
+				entry->dev->ipi_clear();
+		}
+	} else {
+		if (ipi_dev && ipi_dev->ipi_clear)
+			ipi_dev->ipi_clear();
+	}
 
 	/*
 	 * Ensure that memory or MMIO writes after this
@@ -293,12 +339,22 @@ const struct sbi_ipi_device *sbi_ipi_get_device(void)
 	return ipi_dev;
 }
 
-void sbi_ipi_set_device(const struct sbi_ipi_device *dev)
+void sbi_ipi_add_device(const struct sbi_ipi_device *dev)
 {
-	if (!dev || ipi_dev)
+	struct sbi_ipi_device_node *entry;
+
+	if (!dev)
 		return;
 
-	ipi_dev = dev;
+	entry = sbi_zalloc(sizeof(*entry));
+	if (!entry)
+		return;
+	SBI_INIT_LIST_HEAD(&entry->head);
+	entry->dev = dev;
+	sbi_list_add_tail(&entry->head, &ipi_dev_node_list);
+
+	if (!ipi_dev || ipi_dev->rating < dev->rating)
+		ipi_dev = dev;
 }
 
 int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot)
@@ -329,13 +385,8 @@ int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot)
 	ipi_data = sbi_scratch_offset_ptr(scratch, ipi_data_off);
 	ipi_data->ipi_type = 0x00;
 
-	/*
-	 * Initialize platform IPI support. This will also clear any
-	 * pending IPIs for current/calling HART.
-	 */
-	ret = sbi_platform_ipi_init(sbi_platform_ptr(scratch), cold_boot);
-	if (ret)
-		return ret;
+	/* Clear any pending IPIs for the current hart */
+	sbi_ipi_raw_clear(true);
 
 	/* Enable software interrupts */
 	csr_set(CSR_MIE, MIP_MSIP);
@@ -350,7 +401,4 @@ void sbi_ipi_exit(struct sbi_scratch *scratch)
 
 	/* Process pending IPIs */
 	sbi_ipi_process();
-
-	/* Platform exit */
-	sbi_platform_ipi_exit(sbi_platform_ptr(scratch));
 }

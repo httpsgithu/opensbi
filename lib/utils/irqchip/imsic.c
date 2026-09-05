@@ -119,53 +119,75 @@ int imsic_map_hartid_to_data(u32 hartid, struct imsic_data *imsic, int file)
 	return 0;
 }
 
-struct imsic_data *imsic_get_data(u32 hartid)
+struct imsic_data *imsic_get_data(u32 hartindex)
 {
 	struct sbi_scratch *scratch;
 
 	if (!imsic_ptr_offset)
 		return NULL;
 
-	scratch = sbi_hartid_to_scratch(hartid);
+	scratch = sbi_hartindex_to_scratch(hartindex);
 	if (!scratch)
 		return NULL;
 
 	return imsic_get_hart_data_ptr(scratch);
 }
 
-int imsic_get_target_file(u32 hartid)
+int imsic_get_target_file(u32 hartindex)
 {
 	struct sbi_scratch *scratch;
 
 	if (!imsic_file_offset)
 		return SBI_ENOENT;
 
-	scratch = sbi_hartid_to_scratch(hartid);
+	scratch = sbi_hartindex_to_scratch(hartindex);
 	if (!scratch)
 		return SBI_ENOENT;
 
 	return imsic_get_hart_file(scratch);
 }
 
-static int imsic_external_irqfn(void)
+static int imsic_process_hwirqs(struct sbi_irqchip_device *chip)
 {
+	struct imsic_data *imsic;
 	ulong mirq;
+	u32 hwirq;
+	int rc, ret = 0;
+
+	imsic = container_of(chip, struct imsic_data, irqchip);
+	if (!imsic || !imsic->targets_mmode)
+		return SBI_EINVAL;
+
+	if (imsic_get_data(current_hartindex()) != imsic)
+		return 0;
 
 	while ((mirq = csr_swap(CSR_MTOPEI, 0))) {
-		mirq = (mirq >> IMSIC_TOPEI_ID_SHIFT);
+		hwirq = (mirq >> IMSIC_TOPEI_ID_SHIFT) &
+			IMSIC_TOPEI_ID_MASK;
 
-		switch (mirq) {
-		case IMSIC_IPI_ID:
+		if (hwirq > imsic->num_ids) {
+			sbi_printf("%s: invalid hwirq=%lu num_ids=%lu\n",
+					__func__,
+					(unsigned long)hwirq,
+					(unsigned long)imsic->num_ids);
+			continue;
+		}
+
+		if (hwirq == IMSIC_IPI_ID) {
 			sbi_ipi_process();
-			break;
-		default:
-			sbi_printf("%s: unhandled IRQ%d\n",
-				   __func__, (u32)mirq);
-			break;
+			continue;
+		}
+
+		rc = sbi_irqchip_process_hwirq(chip, hwirq);
+		if (rc && rc != SBI_ENOENT) {
+			sbi_printf("%s: hwirq=%lu failed rc=%d\n",
+					__func__,
+					(unsigned long)hwirq, rc);
+			ret = rc;
 		}
 	}
 
-	return 0;
+	return ret;
 }
 
 static void imsic_ipi_send(u32 hart_index)
@@ -199,32 +221,24 @@ static void imsic_ipi_send(u32 hart_index)
 
 static struct sbi_ipi_device imsic_ipi_device = {
 	.name		= "aia-imsic",
+	.rating		= 300,
 	.ipi_send	= imsic_ipi_send
 };
 
-static void imsic_local_eix_update(unsigned long base_id,
-				   unsigned long num_id, bool pend, bool val)
+static void imsic_local_eix_update(unsigned long id,
+				   bool pend, bool val)
 {
-	unsigned long i, isel, ireg;
-	unsigned long id = base_id, last_id = base_id + num_id;
+	unsigned long isel, ireg = 0;
 
-	while (id < last_id) {
-		isel = id / __riscv_xlen;
-		isel *= __riscv_xlen / IMSIC_EIPx_BITS;
-		isel += (pend) ? IMSIC_EIP0 : IMSIC_EIE0;
+	isel = id / __riscv_xlen;
+	isel *= __riscv_xlen / IMSIC_EIPx_BITS;
+	isel += (pend) ? IMSIC_EIP0 : IMSIC_EIE0;
+	ireg |= BIT(id);
 
-		ireg = 0;
-		for (i = id & (__riscv_xlen - 1);
-		     (id < last_id) && (i < __riscv_xlen); i++) {
-			ireg |= BIT(i);
-			id++;
-		}
-
-		if (val)
-			imsic_csr_set(isel, ireg);
-		else
-			imsic_csr_clear(isel, ireg);
-	}
+	if (val)
+		imsic_csr_set(isel, ireg);
+	else
+		imsic_csr_clear(isel, ireg);
 }
 
 void imsic_local_irqchip_init(void)
@@ -241,7 +255,7 @@ void imsic_local_irqchip_init(void)
 	 */
 
 	/* If Smaia not available then do nothing */
-	csr_read_allowed(CSR_MTOPI, (ulong)&trap);
+	csr_read_allowed(CSR_MTOPI, &trap);
 	if (trap.cause)
 		return;
 
@@ -252,22 +266,33 @@ void imsic_local_irqchip_init(void)
 	imsic_csr_write(IMSIC_EIDELIVERY, IMSIC_ENABLE_EIDELIVERY);
 
 	/* Enable IPI */
-	imsic_local_eix_update(IMSIC_IPI_ID, 1, false, true);
+	imsic_local_eix_update(IMSIC_IPI_ID, false, true);
 }
 
-int imsic_warm_irqchip_init(void)
+static int imsic_warm_irqchip_init(struct sbi_irqchip_device *dev)
 {
-	struct imsic_data *imsic = imsic_get_data(current_hartid());
+	struct imsic_data *imsic;
+	struct imsic_data *hart_imsic;
+	int i;
+
+	imsic = container_of(dev, struct imsic_data, irqchip);
+	hart_imsic = imsic_get_data(current_hartindex());
 
 	/* Sanity checks */
-	if (!imsic || !imsic->targets_mmode)
+	if (!hart_imsic || hart_imsic != imsic ||
+		!hart_imsic->targets_mmode)
 		return SBI_EINVAL;
 
-	/* Disable all interrupts */
-	imsic_local_eix_update(1, imsic->num_ids, false, false);
+	/* enable interrutps based on the irq state */
+	for (i = 1; i < imsic->num_ids; i++) {
+		if (sbi_irqchip_is_hwirq_enabled(&imsic->irqchip, i) == true)
+			imsic_local_eix_update(i, true, true);
+		else
+			imsic_local_eix_update(i, false, false);
+	}
 
 	/* Clear IPI pending */
-	imsic_local_eix_update(IMSIC_IPI_ID, 1, true, false);
+	imsic_local_eix_update(IMSIC_IPI_ID, true, false);
 
 	/* Local IMSIC initialization */
 	imsic_local_irqchip_init();
@@ -345,10 +370,196 @@ int imsic_data_check(struct imsic_data *imsic)
 	return 0;
 }
 
+static int imsic_hwirq_setup(struct sbi_irqchip_device *chip, u32 hwirq, u32 hwirq_flags)
+{
+	if (hwirq_flags != SBI_HWIRQ_FLAGS_NONE)
+		return SBI_ENOTSUPP;
+
+	sbi_irqchip_set_raw_handler(chip, hwirq,
+				    sbi_irqchip_raw_handler_default);
+
+	return 0;
+}
+
+static void imsic_hwirq_cleanup(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	struct imsic_data *imsic;
+
+	if (!chip)
+		return;
+
+	imsic = container_of(chip, struct imsic_data, irqchip);
+	if (!imsic || !imsic->targets_mmode)
+		return;
+
+	imsic_local_eix_update(hwirq, false, false);
+	imsic_local_eix_update(hwirq, true, false);
+}
+
+static void imsic_hwirq_eoi(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	/*
+	 * IMSIC interrupt claim/ack is already done by reading CSR_MTOPEI
+	 * in imsic_process_hwirqs(). No extra EOI operation is required.
+	 */
+}
+
+static int imsic_compose_msi_msg(struct imsic_data *imsic,
+				 u32 hart_index, u32 eiid,
+				 struct sbi_irqchip_msi_msg *msg)
+{
+	struct imsic_regs *regs;
+	unsigned long reloff;
+	u64 msi_addr;
+	int file;
+
+	if (!imsic || !msg)
+		return SBI_EINVAL;
+
+	if (!eiid || eiid == IMSIC_IPI_ID)
+		return 0;
+
+	file = imsic_get_target_file(hart_index);
+	if (file < 0) {
+		sbi_printf("%s: no file for hart=%lu rc=%d\n",
+				__func__,
+				(unsigned long)hart_index, file);
+		return file;
+	}
+
+	regs   = &imsic->regs[0];
+	reloff = file * (1UL << imsic->guest_index_bits) * IMSIC_MMIO_PAGE_SZ;
+
+	while (regs->size && regs->size <= reloff) {
+		reloff -= regs->size;
+		regs++;
+	}
+
+	if (!regs->size || regs->size <= reloff) {
+		sbi_printf("%s: no regset for hart=%lu file=%d reloff=0x%lx\n",
+			   __func__,
+			   (unsigned long)hart_index, file, reloff);
+		return SBI_ENODEV;
+	}
+
+	msi_addr = (u64)regs->addr + reloff + IMSIC_MMIO_PAGE_LE;
+	msg->address_lo = (u32)(msi_addr);
+	msg->address_hi = (u32)(msi_addr >> 32);
+	msg->data       = eiid;
+
+	return 0;
+}
+
+static int imsic_program_msi(struct sbi_irqchip_device *chip,
+		      u32 eiid, u32 hart_index)
+{
+	struct imsic_data *imsic;
+	struct sbi_irqchip_msi_msg msg;
+	int rc;
+
+	if (!chip)
+		return SBI_EINVAL;
+
+	imsic = imsic_get_data(hart_index);
+	if (!imsic || !imsic->targets_mmode)
+		return SBI_ENODEV;
+
+	rc = imsic_compose_msi_msg(imsic, hart_index, eiid, &msg);
+	if (rc) {
+		sbi_printf("%s: compose failed eiid=%lu hart=%lu rc=%d\n",
+				__func__,
+				(unsigned long)eiid,
+				(unsigned long)hart_index, rc);
+	}
+
+	rc = sbi_irqchip_write_msi(chip, eiid, &msg);
+	if (rc) {
+		sbi_printf("%s: write_msi failed eiid=%lu hart=%lu rc=%d\n",
+				__func__,
+				(unsigned long)eiid,
+				(unsigned long)hart_index, rc);
+		return rc;
+	}
+
+	return 0;
+}
+
+static int imsic_hwirq_set_affinity(struct sbi_irqchip_device *chip,
+				    u32 hwirq, u32 hart_index)
+{
+	struct imsic_data *imsic;
+	int rc;
+
+	if (!chip)
+		return SBI_EINVAL;
+
+	imsic = container_of(chip, struct imsic_data, irqchip);
+	if (!imsic || !imsic->targets_mmode)
+		return SBI_EINVAL;
+
+	if (!hwirq || hwirq == IMSIC_IPI_ID)
+		return 0;
+
+	if (!sbi_hartmask_test_hartindex(hart_index, &chip->target_harts))
+		return SBI_EINVAL;
+
+	rc = imsic_program_msi(chip, hwirq, hart_index);
+	if (rc) {
+		sbi_printf("%s: failed hwirq=%lu hart=%lu rc=%d\n",
+				__func__,
+				(unsigned long)hwirq,
+				(unsigned long)hart_index, rc);
+		return rc;
+	}
+
+	return 0;
+}
+
+static void imsic_hwirq_mask(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	struct imsic_data *imsic;
+
+	if (!chip)
+		return;
+
+	imsic = container_of(chip, struct imsic_data, irqchip);
+	if (!imsic || !imsic->targets_mmode)
+		return;
+
+	imsic_local_eix_update(hwirq, false, false);
+}
+
+static void imsic_hwirq_unmask(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	struct imsic_data *imsic;
+
+	if (!chip)
+		return;
+
+	imsic = container_of(chip, struct imsic_data, irqchip);
+	if (!imsic || !imsic->targets_mmode)
+		return;
+
+	if (!hwirq || hwirq == IMSIC_IPI_ID)
+		return;
+
+	imsic_local_eix_update(hwirq, false, true);
+}
+
+static struct sbi_irqchip_device imsic_device = {
+	.warm_init		= imsic_warm_irqchip_init,
+	.process_hwirqs		= imsic_process_hwirqs,
+	.hwirq_setup		= imsic_hwirq_setup,
+	.hwirq_cleanup		= imsic_hwirq_cleanup,
+	.hwirq_eoi		= imsic_hwirq_eoi,
+	.hwirq_set_affinity	= imsic_hwirq_set_affinity,
+	.hwirq_mask		= imsic_hwirq_mask,
+	.hwirq_unmask		= imsic_hwirq_unmask,
+};
+
 int imsic_cold_irqchip_init(struct imsic_data *imsic)
 {
 	int i, rc;
-	struct sbi_domain_memregion reg;
 
 	/* Sanity checks */
 	rc = imsic_data_check(imsic);
@@ -373,24 +584,42 @@ int imsic_cold_irqchip_init(struct imsic_data *imsic)
 			return SBI_ENOMEM;
 	}
 
-	/* Setup external interrupt function for IMSIC */
-	sbi_irqchip_set_irqfn(imsic_external_irqfn);
-
 	/* Add IMSIC regions to the root domain */
 	for (i = 0; i < IMSIC_MAX_REGS && imsic->regs[i].size; i++) {
-		sbi_domain_memregion_init(imsic->regs[i].addr,
-					  imsic->regs[i].size,
-					  (SBI_DOMAIN_MEMREGION_MMIO |
-					   SBI_DOMAIN_MEMREGION_M_READABLE |
-					   SBI_DOMAIN_MEMREGION_M_WRITABLE),
-					  &reg);
-		rc = sbi_domain_root_add_memregion(&reg);
+		rc = sbi_domain_root_add_memrange(imsic->regs[i].addr,
+						  imsic->regs[i].size,
+						  IMSIC_MMIO_PAGE_SZ,
+						  SBI_DOMAIN_MEMREGION_MMIO |
+						  SBI_DOMAIN_MEMREGION_M_READABLE |
+						  SBI_DOMAIN_MEMREGION_M_WRITABLE);
 		if (rc)
 			return rc;
 	}
 
+	imsic->irqchip          = imsic_device;
+	imsic->irqchip.id       = imsic->unique_id;
+	imsic_device.caps = SBI_IRQCHIP_CAPS_MSI;
+	imsic->irqchip.num_hwirq = imsic->num_ids + 1;
+
+	sbi_hartmask_set_all(&imsic->irqchip.target_harts);
+
+	/* Register irqchip device */
+	rc = sbi_irqchip_add_device(&imsic->irqchip);
+	if (rc) {
+		sbi_printf("%s: sbi_irqchip_add_device failed rc=%d\n",
+				__func__, rc);
+		return rc;
+	}
+
+	rc = sbi_irqchip_register_reserved(&imsic->irqchip, 0, IMSIC_IPI_ID + 1);
+	if (rc) {
+		sbi_printf("%s: register_reserved failed rc=%d\n",
+				__func__, rc);
+		return rc;
+	}
+
 	/* Register IPI device */
-	sbi_ipi_set_device(&imsic_ipi_device);
+	sbi_ipi_add_device(&imsic_ipi_device);
 
 	return 0;
 }
